@@ -4,7 +4,14 @@ from django.db import transaction
 from django.db.models import F, Max
 from rest_framework import serializers
 
-from .models import Playlist, PlaylistSong, Song
+from .models import (
+    Playlist,
+    PlaylistCollaborator,
+    PlaylistComment,
+    PlaylistSong,
+    Song,
+)
+from .permissions import get_playlist_role
 
 User = get_user_model()
 
@@ -47,9 +54,103 @@ class PlaylistSongSerializer(serializers.ModelSerializer):
         fields = ["id", "order", "song"]
 
 
+class PlaylistCollaboratorSerializer(serializers.ModelSerializer):
+    user = UserSerializer(read_only=True)
+    added_by = serializers.CharField(source="added_by.username", read_only=True)
+
+    class Meta:
+        model = PlaylistCollaborator
+        fields = ["id", "user", "role", "added_by", "created_at"]
+        read_only_fields = fields
+
+
+class PlaylistCollaboratorWriteSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(required=False, write_only=True)
+    username = serializers.CharField(required=False, write_only=True)
+
+    class Meta:
+        model = PlaylistCollaborator
+        fields = ["id", "user_id", "username", "role"]
+        read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        user_id = attrs.get("user_id")
+        username = attrs.get("username")
+        playlist = self.context["playlist"]
+
+        if self.instance is None and not user_id and not username:
+            raise serializers.ValidationError(
+                {"user_id": "Provide either user_id or username."}
+            )
+
+        if self.instance is not None and (user_id or username):
+            raise serializers.ValidationError(
+                {"user_id": "Updating collaborator user is not supported."}
+            )
+
+        if self.instance is None:
+            query = User.objects.all()
+            if user_id:
+                user = query.filter(pk=user_id).first()
+            else:
+                user = query.filter(username=username).first()
+
+            if user is None:
+                raise serializers.ValidationError(
+                    {"user_id": "The selected user does not exist."}
+                )
+            if playlist.owner_id == user.id:
+                raise serializers.ValidationError(
+                    {"user_id": "The playlist owner is already the owner."}
+                )
+            if playlist.collaborators.filter(user_id=user.id).exists():
+                raise serializers.ValidationError(
+                    {"user_id": "This user is already a collaborator."}
+                )
+
+            attrs["user"] = user
+
+        return attrs
+
+    def create(self, validated_data):
+        validated_data.pop("user_id", None)
+        validated_data.pop("username", None)
+        return PlaylistCollaborator.objects.create(**validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("user_id", None)
+        validated_data.pop("username", None)
+        instance.role = validated_data.get("role", instance.role)
+        instance.save(update_fields=["role"])
+        return instance
+
+
+class PlaylistCommentSerializer(serializers.ModelSerializer):
+    user = UserSerializer(read_only=True)
+
+    class Meta:
+        model = PlaylistComment
+        fields = ["id", "user", "content", "created_at", "updated_at"]
+        read_only_fields = fields
+
+
+class PlaylistCommentWriteSerializer(serializers.ModelSerializer):
+    content = serializers.CharField(max_length=1000)
+
+    class Meta:
+        model = PlaylistComment
+        fields = ["id", "content"]
+        read_only_fields = ["id"]
+
+
 class PlaylistListSerializer(serializers.ModelSerializer):
     owner = serializers.CharField(source="owner.username", read_only=True)
     song_count = serializers.IntegerField(read_only=True)
+    likes_count = serializers.IntegerField(read_only=True)
+    comments_count = serializers.IntegerField(read_only=True)
+    collaborators_count = serializers.IntegerField(read_only=True)
+    user_role = serializers.SerializerMethodField()
+    is_liked = serializers.SerializerMethodField()
 
     class Meta:
         model = Playlist
@@ -61,8 +162,30 @@ class PlaylistListSerializer(serializers.ModelSerializer):
             "is_public",
             "created_at",
             "song_count",
+            "likes_count",
+            "comments_count",
+            "collaborators_count",
+            "user_role",
+            "is_liked",
         ]
-        read_only_fields = ["id", "owner", "created_at", "song_count"]
+        read_only_fields = fields
+
+    def get_user_role(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return get_playlist_role(user, obj)
+
+    def get_is_liked(self, obj):
+        annotated_value = getattr(obj, "is_liked", None)
+        if annotated_value is not None:
+            return annotated_value
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            return False
+
+        return obj.likes.filter(user=user).exists()
 
 
 class PlaylistWriteSerializer(serializers.ModelSerializer):
@@ -72,30 +195,32 @@ class PlaylistWriteSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
-class PlaylistDetailSerializer(serializers.ModelSerializer):
-    owner = serializers.CharField(source="owner.username", read_only=True)
+class PlaylistDetailSerializer(PlaylistListSerializer):
     songs = PlaylistSongSerializer(source="playlist_songs", many=True, read_only=True)
+    collaborators = serializers.SerializerMethodField()
     share_token = serializers.SerializerMethodField()
     share_url = serializers.SerializerMethodField()
 
-    class Meta:
-        model = Playlist
-        fields = [
-            "id",
-            "name",
-            "description",
-            "owner",
-            "is_public",
-            "created_at",
+    class Meta(PlaylistListSerializer.Meta):
+        fields = PlaylistListSerializer.Meta.fields + [
             "share_token",
             "share_url",
             "songs",
+            "collaborators",
         ]
         read_only_fields = fields
 
+    def get_collaborators(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated or obj.owner_id != user.id:
+            return []
+        return PlaylistCollaboratorSerializer(obj.collaborators.all(), many=True).data
+
     def get_share_token(self, obj):
         request = self.context.get("request")
-        if not request or not request.user.is_authenticated or request.user != obj.owner:
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated or obj.owner_id != user.id:
             return None
         share_link = next(iter(obj.share_links.all()), None)
         return share_link.token if share_link else None
@@ -108,21 +233,11 @@ class PlaylistDetailSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(f"/api/share/{share_token}/")
 
 
-class PublicPlaylistDetailSerializer(serializers.ModelSerializer):
-    owner = serializers.CharField(source="owner.username", read_only=True)
+class PublicPlaylistDetailSerializer(PlaylistListSerializer):
     songs = PlaylistSongSerializer(source="playlist_songs", many=True, read_only=True)
 
-    class Meta:
-        model = Playlist
-        fields = [
-            "id",
-            "name",
-            "description",
-            "owner",
-            "is_public",
-            "created_at",
-            "songs",
-        ]
+    class Meta(PlaylistListSerializer.Meta):
+        fields = PlaylistListSerializer.Meta.fields + ["songs"]
         read_only_fields = fields
 
 
